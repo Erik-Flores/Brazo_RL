@@ -3,7 +3,7 @@ import pybullet_data
 import time
 import os
 import numpy as np
-import math # Para cálculos angulares si fueran necesarios
+import math
 
 # Constantes del entorno
 ROBOT_URDF_PATH = os.path.join(pybullet_data.getDataPath(), "kuka_iiwa", "model.urdf")
@@ -11,273 +11,241 @@ CUP_URDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "
 PLANE_URDF_PATH = os.path.join(pybullet_data.getDataPath(), "plane.urdf")
 
 # Límites del espacio de trabajo y acción
-X_MIN = -0.5  # 50 cm a la izquierda del centro
-X_MAX = 0.5   # 50 cm a la derecha del centro (total 1 metro)
-TABLE_HEIGHT = 0.0 # Altura del plano/mesa donde se coloca el vaso
-CUP_HEIGHT_OFFSET = 0.05 # La mitad de la altura del vaso (para que su base esté en el suelo)
+X_MIN = -1.0
+X_MAX = 1.0
+TABLE_HEIGHT = 0.0
+CUP_HEIGHT_OFFSET = 0.05
 
-MAX_EPISODE_STEPS = 500 # Máximo de pasos por episodio para el agente
+MAX_EPISODE_STEPS = 1000
+
+# --- NUEVAS CONSTANTES PARA LA CÁMARA ---
+CAMERA_WIDTH = 64
+CAMERA_HEIGHT = 64
+CAMERA_FOV = 60 # Campo de visión en grados
+CAMERA_NEAR = 0.1 # Distancia mínima de renderizado
+CAMERA_FAR = 10.0 # Distancia máxima de renderizado
+
+# Posición de la cámara (ej. justo encima y mirando hacia abajo)
+# Ajusta estas coordenadas para que la cámara vea el espacio de trabajo y el vaso.
+CAMERA_POSITION = [0.0, 0.0, 2.5] # X, Y, Z de la cámara
+CAMERA_TARGET = [0.0, 0.0, 0.0]  # Punto al que mira la cámara (centro del espacio de trabajo)
+CAMERA_UP_VECTOR = [0, 1, 0] # Vector que indica la dirección "arriba" de la cámara
+# --- FIN NUEVAS CONSTANTES PARA LA CÁMARA ---
+
 
 class RobotEnv:
     def __init__(self, render=True):
-        # --- CAMBIO CLAVE AQUÍ ---
         if render:
-            self.physicsClient = p.connect(p.GUI) # Guarda la ID de la conexión
+            self.physicsClient = p.connect(p.GUI)
         else:
-            self.physicsClient = p.connect(p.DIRECT) # Guarda la ID de la conexión
-        # --- FIN DEL CAMBIO CLAVE ---
+            self.physicsClient = p.connect(p.DIRECT)
 
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, -9.8)
-        p.setTimeStep(1./240.) # Paso de tiempo de simulación
+        p.setTimeStep(1./240.)
 
         self.robot_id = None
         self.cup_id = None
         self.plane_id = None
 
-        # --- Definición de espacio de acción y observación (crucial para RL) ---
-        # Espacio de Acciones: Movimiento de cada articulación del brazo, activación del empuje.
-        # Simplificación: Asumiremos control de posición para las primeras articulaciones del Kuka.
-        # Kuka LBR iiwa tiene 7 articulaciones. Podemos controlar las 3 o 4 primeras para simplificar.
-        self.joint_indices = [0, 1, 2, 3, 4, 5, 6] # Todas las 7 articulaciones del Kuka
+        self.joint_indices = [0, 1, 2, 3, 4, 5, 6]
+        self.joint_limits_low = [-2.967, -2.094, -2.967, -2.094, -2.967, -2.094, -3.054]
+        self.joint_limits_high = [2.967, 2.094, 2.967, 2.094, 2.967, 2.094, 3.054]
 
-        # Límites de las articulaciones (ajusta según los límites reales del Kuka si los conoces)
-        # Esto es muy importante, un robot real tiene límites estrictos.
-        # Estos son ejemplos, consulta la documentación del Kuka o el URDF para valores exactos.
-        self.joint_limits_low = [-2.967, -2.094, -2.967, -2.094, -2.967, -2.094, -3.054] # Radianes
-        self.joint_limits_high = [2.967, 2.094, 2.967, 2.094, 2.967, 2.094, 3.054] # Radianes
-
-        # Espacio de Acción: Un valor para cada articulación (ej. cambio en el ángulo)
-        # y una acción para "empujar" (binaria o continua).
-        # Simplificación: Control de posición directa para N articulaciones + acción de empuje.
-        # Acciones: [delta_joint0, delta_joint1, ..., delta_jointN-1, push_action_value]
-        # Por ahora, vamos a controlar las 7 articulaciones con un pequeño cambio en el ángulo
-        # y una acción de "empuje" que se activa al final.
-        # Definiremos 7 acciones continuas para las articulaciones (un valor entre -1 y 1 que se mapea a un delta de ángulo)
-        # y una acción discreta para el "empuje" (0 o 1).
-        # Para simplificar y usar PPO, podemos hacer que todas las acciones sean continuas.
-        # La última acción será el "empuje".
         self.action_space_dims = len(self.joint_indices) + 1 # 7 articulaciones + 1 para empuje
-        self.action_scale = 0.05 # Cuánto cambia el ángulo por cada acción continua (-1 a 1)
-                                 # 0.05 radianes es ~2.8 grados.
+        self.action_scale = 0.05
 
-        # Espacio de Observación (Estado):
-        # - Posición del vaso (x, y, z)
-        # - Ángulos de las articulaciones del brazo (para las 7 articulaciones)
-        # - (Opcional, para simular cámara): Imagen (píxeles). Por ahora, simplificaremos esto.
-        # Simplificamos la "cámara" a tener acceso a la posición del vaso directamente para este prototipo.
-        # Un estado completo sería: [pos_vaso_x, pos_vaso_y, pos_vaso_z, joint0_angle, ..., joint6_angle]
-        self.observation_space_dims = 3 + len(self.joint_indices) # Posición (x,y,z) del vaso + 7 ángulos
+        # --- MODIFICACIÓN: ESPACIO DE OBSERVACIÓN ---
+        # Posición del vaso (3) + Ángulos de las articulaciones (7) + Datos de la cámara (width * height * canales)
+        # Asumiremos imágenes en escala de grises para simplificar (1 canal). Si es RGB, sería * 3.
+        # Es común pasar solo el canal de profundidad o la imagen en escala de grises a la red neuronal inicial.
+        self.observation_space_dims = 3 + len(self.joint_indices) + (CAMERA_WIDTH * CAMERA_HEIGHT * 1) # Asumiendo 1 canal (escala de grises/profundidad)
+        # --- FIN MODIFICACIÓN ---
 
         self.current_episode_steps = 0
         self.max_episode_steps = MAX_EPISODE_STEPS
-
-        # Posición inicial del robot (útil para resetear)
         self.robot_initial_joint_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        # self.robot_initial_joint_positions = [0.0, -0.9, 0.0, 1.8, 0.0, -0.9, 0.0] # Una posición más "doblada" si prefieres
+
+        # --- NUEVOS ATRIBUTOS PARA LA CÁMARA ---
+        self.view_matrix = p.computeViewMatrix(
+            cameraEyePosition=CAMERA_POSITION,
+            cameraTargetPosition=CAMERA_TARGET,
+            cameraUpVector=CAMERA_UP_VECTOR
+        )
+        self.projection_matrix = p.computeProjectionMatrixFOV(
+            fov=CAMERA_FOV,
+            aspect=float(CAMERA_WIDTH) / CAMERA_HEIGHT,
+            nearVal=CAMERA_NEAR,
+            farVal=CAMERA_FAR
+        )
+        # --- FIN NUEVOS ATRIBUTOS PARA LA CÁMARA ---
 
     def reset(self):
-        """
-        Reinicia el entorno a un estado inicial para un nuevo episodio.
-        Carga el robot y el vaso, y coloca el vaso en una posición aleatoria.
-        """
-        p.resetSimulation() # Limpia la simulación anterior
-        p.setGravity(0, 0, -9.8) # Vuelve a configurar gravedad
-
+        p.resetSimulation()
+        p.setGravity(0, 0, -9.8)
         self.plane_id = p.loadURDF(PLANE_URDF_PATH)
 
-        # Cargar el brazo robótico Kuka
         robot_start_pos = [0, 0, 0]
         robot_start_orientation = p.getQuaternionFromEuler([0, 0, 0])
         self.robot_id = p.loadURDF(ROBOT_URDF_PATH, robot_start_pos, robot_start_orientation, useFixedBase=True)
 
-        # Resetear articulaciones a la posición inicial
         for i, joint_index in enumerate(self.joint_indices):
             p.resetJointState(self.robot_id, joint_index, self.robot_initial_joint_positions[i])
-            # Aplicar control de posición para que el robot vaya a esa posición de forma estable
             p.setJointMotorControl2(self.robot_id,
                                     joint_index,
                                     p.POSITION_CONTROL,
                                     targetPosition=self.robot_initial_joint_positions[i],
-                                    force=500 # Una fuerza razonable para moverlo
+                                    force=500
                                     )
-        # Ejecutar unos pasos para que el robot alcance la posición inicial
-        for _ in range(240): # Un segundo de simulación
+        for _ in range(240):
             p.stepSimulation()
 
-
-        # Colocar el vaso en una posición aleatoria en el plano de 1 metro (solo eje X)
-        # El plano es de 1 metro, así que X_MIN y X_MAX son -0.5 y 0.5
         cup_x_pos = np.random.uniform(X_MIN, X_MAX)
-        cup_y_pos = 0.0 # El vaso se mueve solo en el eje X, por lo tanto, Y es fijo.
-        cup_z_pos = TABLE_HEIGHT + CUP_HEIGHT_OFFSET # Para que el vaso esté sobre el plano
+        cup_y_pos = 0.0
+        cup_z_pos = TABLE_HEIGHT + CUP_HEIGHT_OFFSET
 
         cup_start_pos = [cup_x_pos, cup_y_pos, cup_z_pos]
-        cup_start_orn = p.getQuaternionFromEuler([0, 0, np.random.uniform(-np.pi, np.pi)]) # Orientación aleatoria en Z
+        cup_start_orn = p.getQuaternionFromEuler([0, 0, np.random.uniform(-np.pi, np.pi)])
 
         self.cup_id = p.loadURDF(CUP_URDF_PATH, cup_start_pos, cup_start_orn)
 
         self.current_episode_steps = 0
 
-        # Obtener el estado inicial y retornarlo
         observation = self._get_observation()
         return observation
 
     def step(self, action):
-        """
-        Aplica una acción al entorno, avanza la simulación y calcula la recompensa.
-        Args:
-            action (np.array): Array de valores de acción.
-                               Ej: [delta_joint0, ..., delta_joint6, push_action_value]
-        Returns:
-            tuple: (observation, reward, done, info)
-        """
         self.current_episode_steps += 1
 
-        # Mover las articulaciones del brazo
-        # La acción es un vector de 8 elementos. Los primeros 7 son para las articulaciones.
-        # El último es para la acción de empuje.
-        joint_actions = action[:-1] # Las primeras 7 acciones para las articulaciones
-        push_action_value = action[-1] # La última acción para el empuje
+        # --- FIX: Initialize reward at the very beginning of the method ---
+        reward = 0 # Initialize reward to 0 here
+        # --- END FIX ---
 
-        # Obtener las posiciones actuales de las articulaciones
+        joint_actions = action[:-1]
+        push_action_value = action[-1]
+
         current_joint_positions = [p.getJointState(self.robot_id, i)[0] for i in self.joint_indices]
 
-        # Calcular las nuevas posiciones objetivo para las articulaciones
         target_joint_positions = []
         for i, delta in enumerate(joint_actions):
             new_pos = current_joint_positions[i] + delta * self.action_scale
-            # Limitar la nueva posición a los límites de las articulaciones
             new_pos = np.clip(new_pos, self.joint_limits_low[i], self.joint_limits_high[i])
             target_joint_positions.append(new_pos)
 
-        # Aplicar el control de posición a las articulaciones
         p.setJointMotorControlArray(
             self.robot_id,
             self.joint_indices,
             p.POSITION_CONTROL,
             targetPositions=target_joint_positions,
-            forces=[500] * len(self.joint_indices) # Aplicar una fuerza razonable
+            forces=[500] * len(self.joint_indices)
         )
 
-        # Simular un paso de tiempo
+        # --- MODIFICACIÓN: Lógica de Empuje (más física) ---
+        effector_link_index = p.getNumJoints(self.robot_id) - 1
+
+        link_state = p.getLinkState(self.robot_id, effector_link_index)
+        effector_pos = link_state[0]
+
+        cup_pos, cup_orn = p.getBasePositionAndOrientation(self.cup_id)
+        distance_to_cup = np.linalg.norm(np.array(effector_pos[:2]) - np.array(cup_pos[:2]))
+
+        if push_action_value > 0.5 and distance_to_cup < 0.15:
+            push_force_magnitude = 100
+
+            force_direction = np.array(cup_pos) - np.array(effector_pos)
+            force_direction[2] = 0
+            force_direction_normalized = force_direction / (np.linalg.norm(force_direction) + 1e-6)
+
+            force_application_point = [cup_pos[0], cup_pos[1], cup_pos[2] - CUP_HEIGHT_OFFSET + 0.01]
+
+            p.applyExternalForce(self.cup_id, -1,
+                                 list(push_force_magnitude * force_direction_normalized),
+                                 force_application_point,
+                                 p.WORLD_FRAME)
+            reward += 0.5 # Now 'reward' exists and can be modified
+            print("Aplicando empuje al vaso.")
+
         p.stepSimulation()
 
         # --- Calcular Recompensa ---
-        reward = 0
-        done = False # Indica si el episodio ha terminado
+        # The 'reward = 0' line was moved to the top.
+        done = False
 
-        # Obtener posición actual del efector final del robot (la "mano" o herramienta)
-        # Necesitas saber el índice del último link/efector final.
-        # Para Kuka LBR iiwa, el efector final suele ser el link 6 (link 7 si contamos desde 1).
-        # Podemos obtenerlo mirando el URDF o imprimiendo la información de las articulaciones.
-        # p.getJointInfo(robot_id, 6) te daría el link asociado a esa articulación.
-        # Para simplificar, asumiremos que el último link es el efector final.
-        num_links = p.getNumJoints(self.robot_id)
-        # El link "end effector" es el último link del robot, que es el link asociado al último joint.
-        # Si el Kuka tiene 7 articulaciones (0 a 6), el link 7 es el último link del brazo.
-        # En PyBullet, los links tienen índices que corresponden a los índices de las articulaciones que los preceden.
-        # Así que si joint 6 es el último, el link 6 es el efector final.
-        effector_link_index = num_links - 1 # Última articulación/link
-
-        link_state = p.getLinkState(self.robot_id, effector_link_index)
-        effector_pos = link_state[0] # Posición cartesiana del efector final
-
-        # Obtener posición actual del vaso
         cup_pos, cup_orn = p.getBasePositionAndOrientation(self.cup_id)
         cup_euler = p.getEulerFromQuaternion(cup_orn)
 
-        # Recompensa por aproximación al vaso
-        distance_to_cup = np.linalg.norm(np.array(effector_pos[:2]) - np.array(cup_pos[:2])) # Solo en XY, ignorar Z por ahora
-        reward += max(0, 1.0 - distance_to_cup) * 0.1 # Recompensa proporcional a la cercanía
+        link_state = p.getLinkState(self.robot_id, effector_link_index)
+        effector_pos = link_state[0]
+        distance_to_cup = np.linalg.norm(np.array(effector_pos[:2]) - np.array(cup_pos[:2]))
+        reward += max(0, 1.0 - distance_to_cup) * 0.1
 
-        # Detectar colisiones o contacto del brazo con el vaso
-        # contact_points = p.getContactPoints(self.robot_id, self.cup_id)
-        # if len(contact_points) > 0:
-        #     reward += 0.5 # Pequeña recompensa por tocar el vaso
+        original_cup_z_axis_world = [0,0,1]
+        cup_rot_matrix = p.getMatrixFromQuaternion(cup_orn)
+        cup_rot_matrix = np.array(cup_rot_matrix).reshape(3,3)
+        current_cup_z_axis_world = cup_rot_matrix @ np.array([0,0,1])
 
-        # Lógica de Recompensa por Volteo / Desplazamiento
-        # Para "voltear el vaso", podemos verificar la orientación del vaso (euler_z)
-        # o si se ha desplazado significativamente de su posición inicial (más complejo).
-        # Simplificación: El vaso se "voltea" si su orientación en Z cambia drásticamente (ej. más de 90 grados).
-        # Esto es muy simplificado para el "mecanismo de empuje".
-        # En un sistema real, un empuje causaría una fuerza. Aquí, podemos simularlo.
+        angle_diff = np.arccos(np.dot(original_cup_z_axis_world, current_cup_z_axis_world))
 
-        # Si la acción de empuje es suficientemente alta (ej. > 0.5) y el efector está cerca
-        # Asumiremos que el "empuje" voltea el vaso si está cerca.
-        # En una implementación real, aplicarías una fuerza al vaso.
-        if push_action_value > 0.5: # Si la acción de "empuje" se activó (acción continua > 0.5)
-            if distance_to_cup < 0.1: # Si el efector final está cerca del vaso (10 cm)
-                # Voltea el vaso de alguna manera simulada para el aprendizaje
-                # Podemos darle una rotación aleatoria para simular el volteo
-                p.resetBasePositionAndOrientation(self.cup_id, cup_pos,
-                                                  p.getQuaternionFromEuler([np.pi/2, 0, np.random.uniform(-np.pi, np.pi)]))
-                reward += 100 # Gran recompensa por voltear
-                done = True # Episodio terminado por éxito
-                print("¡Vaso volteado!")
-            else:
-                reward -= 5 # Penalización por intentar empujar sin estar cerca
-
-        # Recompensa negativa si el vaso se cae (su posición Z es muy baja, ej. debajo del plano)
-        if cup_pos[2] < (TABLE_HEIGHT - CUP_HEIGHT_OFFSET / 2): # Si el vaso cae por debajo del nivel esperado
-            reward -= 50
+        if angle_diff > (np.pi / 3):
+            reward += 100
             done = True
-            print("¡Vaso caído!")
+            print("¡Vaso volteado/inclinado significativamente!")
+        else:
+            reward += max(0, 1.0 - distance_to_cup) * 0.1
 
-        # Penalización por cada paso de tiempo (fomentar soluciones rápidas)
-        reward -= 0.1
+        if cup_pos[2] < (TABLE_HEIGHT + CUP_HEIGHT_OFFSET / 4):
+            if angle_diff <= (np.pi / 3) and cup_pos[2] < (TABLE_HEIGHT + CUP_HEIGHT_OFFSET / 4):
+                 reward -= 50
+                 done = True
+                 print("¡Vaso caído!")
 
-        # Si el episodio alcanza el número máximo de pasos
+        reward -= 0.01
+
         if self.current_episode_steps >= self.max_episode_steps:
             done = True
-            reward -= 10 # Pequeña penalización por no completar a tiempo
+            reward -= 10
             print("Máximo de pasos alcanzado.")
 
-        # Obtener el nuevo estado
         observation = self._get_observation()
-
-        info = {} # Información adicional (opcional)
+        info = {}
 
         return observation, reward, done, info
-
+    
     def _get_observation(self):
-        """
-        Retorna el estado actual del entorno.
-        """
         # Posición del vaso
         cup_pos, _ = p.getBasePositionAndOrientation(self.cup_id)
 
         # Ángulos de las articulaciones del brazo
         joint_states = p.getJointStates(self.robot_id, self.joint_indices)
-        joint_angles = [state[0] for state in joint_states] # state[0] es la posición angular
+        joint_angles = [state[0] for state in joint_states]
 
-        # Información visual de la cámara (SIMPLIFICADA: NO IMPLEMENTADA AQUÍ)
-        # Para una cámara real:
-        # view_matrix = p.computeViewMatrixFromYawPitchRoll(...)
-        # proj_matrix = p.computeProjectionMatrixFOV(...)
-        # img = p.getCameraImage(width, height, view_matrix, proj_matrix)
-        # visual_data = img[2] # Solo los píxeles RGB
-        # En un agente real, se podría pasar la imagen (un array grande) o características extraídas de ella.
-        # Por simplicidad, en este ejemplo el estado es solo numérico.
+        # --- MODIFICACIÓN: CAPTURA DE IMAGEN DE LA CÁMARA ---
+        img_arr = p.getCameraImage(
+            width=CAMERA_WIDTH,
+            height=CAMERA_HEIGHT,
+            viewMatrix=self.view_matrix,
+            projectionMatrix=self.projection_matrix,
+            renderer=p.ER_BULLET_HARDWARE_OPENGL # Usa este renderizador si está disponible para mejor rendimiento
+                                                 # O p.ER_TINY_RENDERER para CPU si no hay GPU
+        )
+        # img_arr[0] es la anchura, img_arr[1] la altura, img_arr[2] son los valores RGB, img_arr[3] es la profundidad.
+        # Queremos los píxeles de la imagen. La documentación de PyBullet dice que img_arr[2] son los píxeles RGB.
+        # Convertimos a escala de grises para simplificar el estado, y normalizamos a [0, 1]
+        rgb_pixels = np.array(img_arr[2], dtype=np.uint8).reshape((CAMERA_HEIGHT, CAMERA_WIDTH, 4)) # RGBA
+        # Convertir a escala de grises (promedio de RGB) y aplanarla
+        gray_image = np.mean(rgb_pixels[:, :, :3], axis=2) # Ignorar canal alfa, promedio de RGB
+        normalized_gray_image = gray_image / 255.0 # Normalizar a [0, 1]
+        flat_image = normalized_gray_image.flatten() # Aplanar para incluir en el vector de estado
+
+        # --- FIN MODIFICACIÓN ---
 
         # Combina toda la información en un solo vector de NumPy
         observation = np.concatenate([
             np.array(cup_pos),
-            np.array(joint_angles)
+            np.array(joint_angles),
+            flat_image # Añadir los datos de la imagen aplanados
         ])
         return observation
 
     def close(self):
-        """Cierra la conexión con el simulador."""
-        p.disconnect()
-
-# Para verificar las articulaciones del Kuka y obtener sus límites
-# Puedes ejecutar esto una vez para entender el robot
-# if __name__ == '__main__':
-#     env = RobotEnv(render=True)
-#     env.reset()
-#     print("\nInformación de las articulaciones del Kuka:")
-#     for i in range(p.getNumJoints(env.robot_id)):
-#         info = p.getJointInfo(env.robot_id, i)
-#         print(f"Joint {info[0]} (Name: {info[1].decode('utf-8')}): Type={info[2]}, LowerLimit={info[8]}, UpperLimit={info[9]}")
-#     env.close()
+        p.disconnect(self.physicsClient)

@@ -59,5 +59,5 @@ def train(num_episodes=1000):
     env.close() # Cierra el simulador al finalizar el entrenamiento
 
 if __name__ == "__main__":
-    train(num_episodes=10) # Comienza con pocos episodios para probar
+    train(num_episodes=100) # Comienza con pocos episodios para probar
     # Una vez que todo funcione, puedes aumentar num_episodes a 100, 1000, o más.
