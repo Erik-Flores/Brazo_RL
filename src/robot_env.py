@@ -11,26 +11,27 @@ CUP_URDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "
 PLANE_URDF_PATH = os.path.join(pybullet_data.getDataPath(), "plane.urdf")
 
 # Límites del espacio de trabajo y acción
-X_MIN = -1.0
-X_MAX = 1.0
+X_MIN = 0.5
+X_MAX = 1.0 # Este rango ya no será para la generación aleatoria del vaso
 TABLE_HEIGHT = 0.0
-CUP_HEIGHT_OFFSET = 0.05
 
-MAX_EPISODE_STEPS = 1000
+# Posición OBJETIVO FIJA para el vaso
+TARGET_CUP_POS = [0.5, 0.5, 0.0] # Fija en [0.5, 0.5, 0.0]
 
-# --- NUEVAS CONSTANTES PARA LA CÁMARA ---
+MAX_EPISODE_STEPS = 1000 # Reducido a 1000 pasos para acelerar
+
+# --- CONSTANTES DE CÁMARA ELIMINADAS O INUTILIZADAS ---
+# Estas constantes de cámara ya no son necesarias para la observación del agente,
+# pero se mantienen para la visualización de PyBullet GUI si render=True.
 CAMERA_WIDTH = 64
 CAMERA_HEIGHT = 64
-CAMERA_FOV = 60 # Campo de visión en grados
-CAMERA_NEAR = 0.1 # Distancia mínima de renderizado
-CAMERA_FAR = 10.0 # Distancia máxima de renderizado
-
-# Posición de la cámara (ej. justo encima y mirando hacia abajo)
-# Ajusta estas coordenadas para que la cámara vea el espacio de trabajo y el vaso.
-CAMERA_POSITION = [0.0, 0.0, 2.5] # X, Y, Z de la cámara
-CAMERA_TARGET = [0.0, 0.0, 0.0]  # Punto al que mira la cámara (centro del espacio de trabajo)
-CAMERA_UP_VECTOR = [0, 1, 0] # Vector que indica la dirección "arriba" de la cámara
-# --- FIN NUEVAS CONSTANTES PARA LA CÁMARA ---
+CAMERA_FOV = 60
+CAMERA_NEAR = 0.1
+CAMERA_FAR = 10.0
+CAMERA_POSITION = [0.5, 0.0, 2.5]
+CAMERA_TARGET = [0.5, 0.5, 0.0] # Apunta al vaso fijo
+CAMERA_UP_VECTOR = [0, 1, 0]
+# --- FIN CONSTANTES DE CÁMARA ---
 
 
 class RobotEnv:
@@ -52,21 +53,20 @@ class RobotEnv:
         self.joint_limits_low = [-2.967, -2.094, -2.967, -2.094, -2.967, -2.094, -3.054]
         self.joint_limits_high = [2.967, 2.094, 2.967, 2.094, 2.967, 2.094, 3.054]
 
-        self.action_space_dims = len(self.joint_indices) + 1 # 7 articulaciones + 1 para empuje
-        self.action_scale = 0.05
+        # Solo controlaremos las articulaciones, ya no hay acción de "empuje" explícita
+        self.action_space_dims = len(self.joint_indices) # 7 articulaciones
+        self.action_scale = 0.1 # Aumentado para movimientos más rápidos
 
-        # --- MODIFICACIÓN: ESPACIO DE OBSERVACIÓN ---
-        # Posición del vaso (3) + Ángulos de las articulaciones (7) + Datos de la cámara (width * height * canales)
-        # Asumiremos imágenes en escala de grises para simplificar (1 canal). Si es RGB, sería * 3.
-        # Es común pasar solo el canal de profundidad o la imagen en escala de grises a la red neuronal inicial.
-        self.observation_space_dims = 3 + len(self.joint_indices) + (CAMERA_WIDTH * CAMERA_HEIGHT * 1) # Asumiendo 1 canal (escala de grises/profundidad)
+        # --- MODIFICACIÓN: ESPACIO DE OBSERVACIÓN SIMPLIFICADO ---
+        # Posición del efector final (3D) + Ángulos de las articulaciones (7) + Velocidades de las articulaciones (7)
+        self.observation_space_dims = 3 + len(self.joint_indices) + len(self.joint_indices)
         # --- FIN MODIFICACIÓN ---
 
         self.current_episode_steps = 0
         self.max_episode_steps = MAX_EPISODE_STEPS
         self.robot_initial_joint_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-        # --- NUEVOS ATRIBUTOS PARA LA CÁMARA ---
+        # --- ATRIBUTOS PARA LA CÁMARA (solo para visualización GUI) ---
         self.view_matrix = p.computeViewMatrix(
             cameraEyePosition=CAMERA_POSITION,
             cameraTargetPosition=CAMERA_TARGET,
@@ -78,7 +78,11 @@ class RobotEnv:
             nearVal=CAMERA_NEAR,
             farVal=CAMERA_FAR
         )
-        # --- FIN NUEVOS ATRIBUTOS PARA LA CÁMARA ---
+        self.render_mode = render
+        # --- FIN ATRIBUTOS PARA LA CÁMARA ---
+
+        # Almacenar la posición objetivo del vaso
+        self.target_cup_pos = np.array(TARGET_CUP_POS)
 
     def reset(self):
         p.resetSimulation()
@@ -100,29 +104,40 @@ class RobotEnv:
         for _ in range(240):
             p.stepSimulation()
 
-        cup_x_pos = np.random.uniform(X_MIN, X_MAX)
-        cup_y_pos = 0.0
-        cup_z_pos = TABLE_HEIGHT + CUP_HEIGHT_OFFSET
+        # Vaso se genera en la posición FIJA
+        cup_start_pos = TARGET_CUP_POS
+        cup_start_orn = p.getQuaternionFromEuler([0, 0, 0]) # Orientación fija para simplificar
 
-        cup_start_pos = [cup_x_pos, cup_y_pos, cup_z_pos]
-        cup_start_orn = p.getQuaternionFromEuler([0, 0, np.random.uniform(-np.pi, np.pi)])
+        self.cup_id = p.loadURDF(CUP_URDF_PATH, cup_start_pos, cup_start_orn, useFixedBase=False)
 
-        self.cup_id = p.loadURDF(CUP_URDF_PATH, cup_start_pos, cup_start_orn)
+        # Fijar brevemente el vaso para que se asiente, luego liberar
+        constraint_id = p.createConstraint(
+            parentBodyUniqueId=self.cup_id,
+            parentLinkIndex=-1,
+            childBodyUniqueId=-1, # World
+            childLinkIndex=-1,
+            jointType=p.JOINT_FIXED,
+            jointAxis=[0, 0, 0],
+            parentFramePosition=[0, 0, 0],
+            childFramePosition=cup_start_pos
+        )
+        for _ in range(50):
+            p.stepSimulation()
+        p.removeConstraint(constraint_id)
 
         self.current_episode_steps = 0
-
         observation = self._get_observation()
         return observation
 
     def step(self, action):
         self.current_episode_steps += 1
 
-        # --- FIX: Initialize reward at the very beginning of the method ---
-        reward = 0 # Initialize reward to 0 here
-        # --- END FIX ---
+        reward = 0.0
+        done = False
+        info = {}
 
-        joint_actions = action[:-1]
-        push_action_value = action[-1]
+        # Todas las acciones son para las articulaciones
+        joint_actions = action 
 
         current_joint_positions = [p.getJointState(self.robot_id, i)[0] for i in self.joint_indices]
 
@@ -140,110 +155,63 @@ class RobotEnv:
             forces=[500] * len(self.joint_indices)
         )
 
-        # --- MODIFICACIÓN: Lógica de Empuje (más física) ---
-        effector_link_index = p.getNumJoints(self.robot_id) - 1
-
-        link_state = p.getLinkState(self.robot_id, effector_link_index)
-        effector_pos = link_state[0]
-
-        cup_pos, cup_orn = p.getBasePositionAndOrientation(self.cup_id)
-        distance_to_cup = np.linalg.norm(np.array(effector_pos[:2]) - np.array(cup_pos[:2]))
-
-        if push_action_value > 0.5 and distance_to_cup < 0.15:
-            push_force_magnitude = 100
-
-            force_direction = np.array(cup_pos) - np.array(effector_pos)
-            force_direction[2] = 0
-            force_direction_normalized = force_direction / (np.linalg.norm(force_direction) + 1e-6)
-
-            force_application_point = [cup_pos[0], cup_pos[1], cup_pos[2] - CUP_HEIGHT_OFFSET + 0.01]
-
-            p.applyExternalForce(self.cup_id, -1,
-                                 list(push_force_magnitude * force_direction_normalized),
-                                 force_application_point,
-                                 p.WORLD_FRAME)
-            reward += 0.5 # Now 'reward' exists and can be modified
-            print("Aplicando empuje al vaso.")
-
         p.stepSimulation()
 
-        # --- Calcular Recompensa ---
-        # The 'reward = 0' line was moved to the top.
-        done = False
-
-        cup_pos, cup_orn = p.getBasePositionAndOrientation(self.cup_id)
-        cup_euler = p.getEulerFromQuaternion(cup_orn)
-
+        # --- Calcular Recompensa (SOLO por proximidad al objetivo) ---
+        effector_link_index = p.getNumJoints(self.robot_id) - 1
         link_state = p.getLinkState(self.robot_id, effector_link_index)
-        effector_pos = link_state[0]
-        distance_to_cup = np.linalg.norm(np.array(effector_pos[:2]) - np.array(cup_pos[:2]))
-        reward += max(0, 1.0 - distance_to_cup) * 0.1
+        effector_pos = np.array(link_state[0])
 
-        original_cup_z_axis_world = [0,0,1]
-        cup_rot_matrix = p.getMatrixFromQuaternion(cup_orn)
-        cup_rot_matrix = np.array(cup_rot_matrix).reshape(3,3)
-        current_cup_z_axis_world = cup_rot_matrix @ np.array([0,0,1])
+        # Distancia euclidiana al objetivo fijo del vaso
+        distance_to_target = np.linalg.norm(effector_pos - self.target_cup_pos)
 
-        angle_diff = np.arccos(np.dot(original_cup_z_axis_world, current_cup_z_axis_world))
-
-        if angle_diff > (np.pi / 3):
-            reward += 100
+        # Recompensa Densa: Cuanto más cerca, mayor recompensa
+        # Usamos una recompensa negativa que se vuelve menos negativa a medida que se acerca
+        # O una recompensa positiva que aumenta exponencialmente al acercarse
+        reward = -distance_to_target * 10.0 # Penalización directa por distancia, ajusta el factor
+        
+        # Opcional: una recompensa más agresiva cerca del objetivo
+        # if distance_to_target < 0.1: # Si está muy cerca (10 cm)
+        #     reward += (0.1 - distance_to_target) * 50.0 # Recompensa extra por ser super preciso
+        
+        # Recompensa grande si alcanza el objetivo con un umbral muy pequeño
+        # Esto ayuda a que el agente sepa cuándo ha "ganado"
+        if distance_to_target < 0.05: # Si está a menos de 5 cm del objetivo
+            reward += 500.0 # Gran recompensa
             done = True
-            print("¡Vaso volteado/inclinado significativamente!")
-        else:
-            reward += max(0, 1.0 - distance_to_cup) * 0.1
+            print(f"¡Objetivo alcanzado! Distancia final: {distance_to_target:.4f}")
 
-        if cup_pos[2] < (TABLE_HEIGHT + CUP_HEIGHT_OFFSET / 4):
-            if angle_diff <= (np.pi / 3) and cup_pos[2] < (TABLE_HEIGHT + CUP_HEIGHT_OFFSET / 4):
-                 reward -= 50
-                 done = True
-                 print("¡Vaso caído!")
+        # Penalización por tiempo (si no se ha alcanzado el objetivo)
+        reward -= 0.01 # Pequeña penalización por cada paso
 
-        reward -= 0.01
-
+        # Fin de episodio por máximo de pasos (si no se ha alcanzado el objetivo)
         if self.current_episode_steps >= self.max_episode_steps:
             done = True
-            reward -= 10
-            print("Máximo de pasos alcanzado.")
+            reward -= 50.0 # Penalización significativa por no lograr el objetivo a tiempo
+            print("Máximo de pasos alcanzado. No se alcanzó el objetivo.")
 
         observation = self._get_observation()
-        info = {}
-
+        # Puedes añadir información extra si es útil para depuración, pero no para el agente
+        info['distance_to_target'] = distance_to_target
+        
         return observation, reward, done, info
     
     def _get_observation(self):
-        # Posición del vaso
-        cup_pos, _ = p.getBasePositionAndOrientation(self.cup_id)
+        # Obtener la posición del efector final
+        effector_link_index = p.getNumJoints(self.robot_id) - 1
+        link_state = p.getLinkState(self.robot_id, effector_link_index)
+        effector_pos = link_state[0] # (x, y, z) del efector final
 
-        # Ángulos de las articulaciones del brazo
+        # Ángulos y velocidades de las articulaciones del brazo
         joint_states = p.getJointStates(self.robot_id, self.joint_indices)
         joint_angles = [state[0] for state in joint_states]
-
-        # --- MODIFICACIÓN: CAPTURA DE IMAGEN DE LA CÁMARA ---
-        img_arr = p.getCameraImage(
-            width=CAMERA_WIDTH,
-            height=CAMERA_HEIGHT,
-            viewMatrix=self.view_matrix,
-            projectionMatrix=self.projection_matrix,
-            renderer=p.ER_BULLET_HARDWARE_OPENGL # Usa este renderizador si está disponible para mejor rendimiento
-                                                 # O p.ER_TINY_RENDERER para CPU si no hay GPU
-        )
-        # img_arr[0] es la anchura, img_arr[1] la altura, img_arr[2] son los valores RGB, img_arr[3] es la profundidad.
-        # Queremos los píxeles de la imagen. La documentación de PyBullet dice que img_arr[2] son los píxeles RGB.
-        # Convertimos a escala de grises para simplificar el estado, y normalizamos a [0, 1]
-        rgb_pixels = np.array(img_arr[2], dtype=np.uint8).reshape((CAMERA_HEIGHT, CAMERA_WIDTH, 4)) # RGBA
-        # Convertir a escala de grises (promedio de RGB) y aplanarla
-        gray_image = np.mean(rgb_pixels[:, :, :3], axis=2) # Ignorar canal alfa, promedio de RGB
-        normalized_gray_image = gray_image / 255.0 # Normalizar a [0, 1]
-        flat_image = normalized_gray_image.flatten() # Aplanar para incluir en el vector de estado
-
-        # --- FIN MODIFICACIÓN ---
+        joint_velocities = [state[1] for state in joint_states]
 
         # Combina toda la información en un solo vector de NumPy
         observation = np.concatenate([
-            np.array(cup_pos),
+            np.array(effector_pos),
             np.array(joint_angles),
-            flat_image # Añadir los datos de la imagen aplanados
+            np.array(joint_velocities)
         ])
         return observation
 
