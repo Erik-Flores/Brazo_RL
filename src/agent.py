@@ -6,54 +6,48 @@ import numpy as np
 
 # --- State Normalizer ---
 class StateNormalizer:
-    def __init__(self, observation_dims):
-        self.mean = np.zeros(observation_dims, dtype=np.float32)
-        self.std = np.ones(observation_dims, dtype=np.float32)
-        self.n_samples = 0
-        self.epsilon = 1e-8 # Para evitar división por cero
+    def __init__(self, observation_space_dims):
+        self.mean = np.zeros(observation_space_dims)
+        self.std = np.ones(observation_space_dims)
+        self.count = 0
+        self.running_sum = np.zeros(observation_space_dims)
+        self.running_sum_sq = np.zeros(observation_space_dims)
 
-    def update(self, observations):
-        observations = np.array(observations, dtype=np.float32)
-        batch_mean = np.mean(observations, axis=0)
-        batch_std = np.std(observations, axis=0)
-        batch_n = observations.shape[0]
+    def normalize(self, obs):
+        if self.count > 0:
+            return (obs - self.mean) / (self.std + 1e-8) # Add small epsilon for stability
+        return obs
 
-        if self.n_samples == 0:
-            self.mean = batch_mean
-            self.std = batch_std
-        else:
-            delta = batch_mean - self.mean
-            total_n = self.n_samples + batch_n
-            
-            self.mean = self.mean + delta * batch_n / total_n
-            
-            new_var = ((self.n_samples * self.std**2) + (batch_n * batch_std**2) + 
-                       (delta**2 * self.n_samples * batch_n / total_n)) / total_n
-            self.std = np.sqrt(new_var)
+    def update(self, obs_batch):
+        # Flatten batch for easier calculation if obs_batch is 2D (batch_size, obs_dim)
+        if obs_batch.ndim == 1:
+            obs_batch = obs_batch[np.newaxis, :] # Make it 2D if it's a single observation
 
-        self.n_samples += batch_n
-        self.std = np.maximum(self.std, self.epsilon) # Ensure std is never zero
+        self.running_sum += np.sum(obs_batch, axis=0)
+        self.running_sum_sq += np.sum(np.square(obs_batch), axis=0)
+        self.count += obs_batch.shape[0]
 
-    def normalize(self, observation):
-        normalized_obs = (observation - self.mean) / (self.std + self.epsilon)
-        return normalized_obs
+        if self.count > 0:
+            self.mean = self.running_sum / self.count
+            # Calculate variance as E[X^2] - (E[X])^2
+            variance = (self.running_sum_sq / self.count) - np.square(self.mean)
+            self.std = np.sqrt(variance + 1e-8) # Add small epsilon for stability
+            # Ensure std is never too small to prevent division by zero
+            self.std[self.std < 1e-2] = 1e-2 # Minimum standard deviation
+
 
 # --- Actor-Critic Network ---
 class ActorCriticNetwork(nn.Module):
     def __init__(self, observation_space_dims, action_space_dims):
         super(ActorCriticNetwork, self).__init__()
 
-        self.common_fc1 = nn.Linear(observation_space_dims, 256)
+        self.common_fc1 = nn.Linear(observation_space_dims, 256) 
         self.common_relu1 = nn.ReLU()
         self.common_fc2 = nn.Linear(256, 256)
         self.common_relu2 = nn.ReLU()
 
         self.actor_mean_layer = nn.Linear(256, action_space_dims)
-        # log_std permite que el valor se ajuste durante el entrenamiento.
-        # Inicializamos con un valor negativo pequeño (-0.5) para tener un std ~0.6,
-        # lo que significa que las acciones al principio serán más "predecibles" (menos aleatorias).
-        # Para más exploración, podemos iniciar con un valor más cercano a 0 (e.g., 0.0) o incluso positivo (e.g., 0.5)
-        # lo que resultará en un std más alto y acciones más aleatorias al principio.
+        # Initialize log_std to a small negative value for less initial exploration, or 0.0 for more
         self.log_std = nn.Parameter(torch.full((action_space_dims,), 0.0)) 
 
         self.critic_value_layer = nn.Linear(256, 1)
@@ -62,8 +56,12 @@ class ActorCriticNetwork(nn.Module):
         common_output = self.common_relu1(self.common_fc1(x))
         common_output = self.common_relu2(self.common_fc2(common_output))
 
-        mean = torch.tanh(self.actor_mean_layer(common_output)) # Acciones en [-1, 1]
-        std = torch.exp(self.log_std) # std from log_std parameter, always positive
+        # Use tanh to constrain action means to [-1, 1], matching action_scale
+        mean = torch.tanh(self.actor_mean_layer(common_output)) 
+        std = torch.exp(self.log_std)
+        
+        # Clamp std to avoid extremely small or large values
+        std = torch.clamp(std, 0.1, 1.0) # Example: std between 0.1 and 1.0
 
         action_distribution = Normal(mean, std)
         
@@ -76,10 +74,9 @@ class ActorCriticNetwork(nn.Module):
 class PPOAgent:
     def __init__(self, observation_space_dims, action_space_dims,
                  clip_param=0.2, ppo_epochs=10, mini_batch_size=64,
-                 actor_lr=3e-4, gamma=0.99, gae_lambda=0.95, entropy_coef=0.05): # Nuevo: entropy_coef
+                 actor_lr=3e-4, gamma=0.99, gae_lambda=0.95, entropy_coef=0.05):
         
         self.actor_critic = ActorCriticNetwork(observation_space_dims, action_space_dims)
-        
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=actor_lr)
 
         self.clip_param = clip_param
@@ -87,19 +84,19 @@ class PPOAgent:
         self.mini_batch_size = mini_batch_size
         self.gamma = gamma
         self.gae_lambda = gae_lambda
-        self.entropy_coef = entropy_coef # Coeficiente para el término de entropía
+        self.entropy_coef = entropy_coef
 
         self.state_normalizer = StateNormalizer(observation_space_dims)
 
     def get_action_and_value(self, obs):
+        self.state_normalizer.update(obs) # Update normalizer with current observation
         normalized_obs = self.state_normalizer.normalize(obs)
         obs_tensor = torch.FloatTensor(normalized_obs).unsqueeze(0)
         
         action_dist, value = self.actor_critic(obs_tensor)
-        action = action_dist.sample()
+        action = action_dist.sample() # Sample action from distribution
         
-        # log_prob and value needs to be detached from the graph to be stored
-        # sum over the dimensions of log_prob to get a single value per action
+        # Calculate log_prob for the sampled action
         log_prob = action_dist.log_prob(action).sum(dim=-1) 
         
         return action.squeeze(0).detach().numpy(), log_prob.item(), value.item()
@@ -107,19 +104,95 @@ class PPOAgent:
     def evaluate_action_and_value(self, obs_tensor, action_tensor):
         action_dist, value = self.actor_critic(obs_tensor)
         log_prob = action_dist.log_prob(action_tensor).sum(dim=-1)
-        # Sum over the dimensions of entropy to get a single value per action
         entropy = action_dist.entropy().sum(dim=-1) 
         return log_prob, value, entropy
 
+    # --- MISSING: compute_gae function ---
+    def compute_gae(self, rewards, dones, values):
+        advantages = []
+        returns = []
+        last_gae_lambda = 0
+        
+        # Ensure values includes the final value for the last state in the rollout
+        # If the episode is done, the value of the next state is 0.
+        # This typically means values should be length (batch_size + 1) or handled carefully.
+        # For simplicity here, we assume values[i] is the value of state[i].
+        # The very last value in the 'values' list should correspond to the value of the *next* state after the last observation in the rollout.
+        # If the rollout ends because the episode is done, this next_value is 0.
+        
+        # This implementation requires values to include the value of the next state *after* the last observation in the rollout.
+        # So if you have N (obs, action, reward, done) tuples, you need N+1 value estimates.
+        # The last value is the value of the state *after* the last reward was received.
+        # If done is True for the last step, then the last value in 'values' should be 0.
+        
+        # Let's adjust for the common case where 'values' are for the states *within* the rollout.
+        # We need the value of the state *after* the last state in the rollout for the GAE calculation.
+        # If the rollout exactly matches batch_size and has a next value, values will be len(rewards) + 1.
+        # If it's a list of values for each state in the rollout:
+        
+        # Assuming values list is [V(s_0), V(s_1), ..., V(s_{N-1}), V(s_N)] where N is batch_size
+        # V(s_N) is the value of the state *after* the last action/reward in the rollout.
+        # If dones[N-1] is True, V(s_N) should be 0.
+        
+        # For simplicity, let's pass state_values (list of values for each state in the rollout)
+        # and ensure the last_value is also passed.
+        # Example: rewards = [r0, r1, r2], dones = [d0, d1, d2], values = [v0, v1, v2]
+        # We need the value of the state *after* s2.
+        
+        # Re-evaluating based on how PPOAgent is called in RLTrainer.
+        # RLTrainer collects `batch_obs`, and then calls `self.agent.actor_critic(torch.FloatTensor(obs).unsqueeze(0))[1].item()`
+        # for each obs in `batch_obs`. So `values` here is `[V(s_0), ..., V(s_{N-1})]`.
+        # We need the value of the last state *after* the last reward, or 0 if terminal.
+        
+        # For the last step, if `dones[-1]` is True, the next state value is 0.
+        # Otherwise, we need to estimate the value of the actual next state.
+        # The RLTrainer typically calls `agent.compute_gae(batch_rewards, batch_dones, values_of_states_in_rollout_except_last_one)`
+        # This is often handled by computing the value of the final observation in the rollout.
+
+        # Correct GAE implementation (assuming values contains V(s) for each s in rollout, N values)
+        # We need V(s_T) as next_value for the last step
+        
+        # The `values` parameter here should be the values for the states IN the batch.
+        # We need the value of the state AFTER the last observation in the batch (or 0 if done).
+        
+        # Simplified GAE calculation:
+        # rewards, dones, values are all of length N (timesteps_per_batch)
+        # We need to get value of the state *after* the last reward if not done.
+        
+        # Let's assume `values` passed to this function is `[V(s_0), V(s_1), ..., V(s_{N-1})]`.
+        # And `batch_rewards`, `batch_dones` are also length N.
+        
+        # The GAE calculation needs the value of the "next state".
+        # So we iterate backwards.
+        
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1: # Last step in the rollout
+                # If the episode ended, next_value is 0. Else, it's value of current state from critic.
+                # Here, we assume `values` provided already represent V(s_t).
+                # So if dones[t] is True, the value of the next state (which doesn't exist) is 0.
+                # Otherwise, if the episode *continues* beyond the rollout, the next_value would be V(s_t+1)
+                # which isn't directly available in this `values` list.
+                # A robust GAE implementation would usually pass V(s_t+1) explicitly.
+                
+                # Let's assume `values` contains V(s_t) for all t in the rollout.
+                # If the episode was done at `t`, then `delta` calculation should use 0 for the future term.
+                next_value = 0 # If episode is done, or if this is the last step in a truncated rollout
+                               # (this often needs a more explicit V(s_T) from the environment)
+            else:
+                next_value = values[t+1] * (1 - dones[t+1]) # Only use next value if not done
+
+            # If current step is done, future rewards and values don't matter, only current reward.
+            delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - values[t]
+            
+            last_gae_lambda = delta + self.gamma * self.gae_lambda * last_gae_lambda * (1 - dones[t])
+            advantages.insert(0, last_gae_lambda) # Insert at beginning to reverse order
+            
+            returns.insert(0, advantages[0] + values[t]) # Returns = advantages + values
+
+        return np.array(returns), np.array(advantages)
+
+
     def update(self, batch_obs, batch_actions, batch_log_probs, batch_returns, batch_advantages):
-        batch_obs = torch.FloatTensor(np.array(batch_obs))
-        batch_actions = torch.FloatTensor(np.array(batch_actions))
-        batch_log_probs = torch.FloatTensor(np.array(batch_log_probs))
-        batch_returns = torch.FloatTensor(np.array(batch_returns))
-        batch_advantages = torch.FloatTensor(np.array(batch_advantages))
-
-        batch_advantages = (batch_advantages - batch_advantages.mean()) / (batch_advantages.std() + 1e-8)
-
         total_actor_loss = 0
         total_critic_loss = 0
         num_minibatches = 0
@@ -138,17 +211,21 @@ class PPOAgent:
                 mini_returns = batch_returns[mini_batch_indices]
                 mini_advantages = batch_advantages[mini_batch_indices]
 
-                new_log_probs, new_values, entropy = self.evaluate_action_and_value(mini_obs, mini_actions)
-                
-                # --- Critic Loss ---
-                critic_loss = (new_values.squeeze() - mini_returns).pow(2).mean()
+                # Ensure values are consistent types
+                mini_obs_tensor = mini_obs
+                mini_actions_tensor = mini_actions
+                mini_old_log_probs_tensor = mini_old_log_probs
+                mini_returns_tensor = mini_returns
+                mini_advantages_tensor = mini_advantages
 
-                # --- Actor Loss (con término de entropía) ---
-                ratio = torch.exp(new_log_probs - mini_old_log_probs)
-                surr1 = ratio * mini_advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * mini_advantages
+                new_log_probs, new_values, entropy = self.evaluate_action_and_value(mini_obs_tensor, mini_actions_tensor)
                 
-                # Maximizar la entropía es equivalente a minimizar -entropy_coef * entropy
+                critic_loss = (new_values.squeeze() - mini_returns_tensor).pow(2).mean()
+
+                ratio = torch.exp(new_log_probs - mini_old_log_probs_tensor)
+                surr1 = ratio * mini_advantages_tensor
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * mini_advantages_tensor
+                
                 actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy.mean() 
 
                 self.optimizer.zero_grad()

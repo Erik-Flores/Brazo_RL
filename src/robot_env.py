@@ -20,18 +20,6 @@ TARGET_CUP_POS = [0.5, 0.5, 0.0] # Fija en [0.5, 0.5, 0.0]
 
 MAX_EPISODE_STEPS = 1000
 
-# --- CONSTANTES DE CÁMARA (solo para visualización GUI) ---
-CAMERA_WIDTH = 64
-CAMERA_HEIGHT = 64
-CAMERA_FOV = 60
-CAMERA_NEAR = 0.1
-CAMERA_FAR = 10.0
-CAMERA_POSITION = [0.5, 0.0, 2.5]
-CAMERA_TARGET = [0.5, 0.5, 0.0] # Apunta al vaso fijo
-CAMERA_UP_VECTOR = [0, 1, 0]
-# --- FIN CONSTANTES DE CÁMARA ---
-
-
 class RobotEnv:
     def __init__(self, render=True):
         if render:
@@ -54,32 +42,26 @@ class RobotEnv:
         self.action_space_dims = len(self.joint_indices)
         self.action_scale = 0.1 # Aumentado para movimientos más rápidos
 
-        # Posición del efector final (3D) + Ángulos de las articulaciones (7) + Velocidades de las articulaciones (7)
-        self.observation_space_dims = 3 + len(self.joint_indices) + len(self.joint_indices)
+        # Posición del efector final (3D) + Ángulos de las articulaciones (7) + Velocidades de las articulaciones (7) + Posición del objetivo (3D)
+        self.observation_space_dims = 3 + len(self.joint_indices) + len(self.joint_indices) + 3 
 
         self.current_episode_steps = 0
         self.max_episode_steps = MAX_EPISODE_STEPS
         self.robot_initial_joint_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-        self.view_matrix = p.computeViewMatrix(
-            cameraEyePosition=CAMERA_POSITION,
-            cameraTargetPosition=CAMERA_TARGET,
-            cameraUpVector=CAMERA_UP_VECTOR
-        )
-        self.projection_matrix = p.computeProjectionMatrixFOV(
-            fov=CAMERA_FOV,
-            aspect=float(CAMERA_WIDTH) / CAMERA_HEIGHT,
-            nearVal=CAMERA_NEAR,
-            farVal=CAMERA_FAR
-        )
         self.render_mode = render
 
         self.target_cup_pos = np.array(TARGET_CUP_POS)
+        self.initial_cup_pos = None # Para almacenar la posición inicial del vaso
 
         # Definir un umbral de velocidad angular máxima aceptable
-        # Ajusta este valor según cuánto quieras penalizar las velocidades altas.
-        # Un valor más bajo penalizará más, uno más alto será más permisivo.
-        self.max_angular_velocity_threshold = 0.5 # Radianes por segundo (ejemplo)
+        self.max_angular_velocity_threshold = 0.5 
+        
+        # Umbral de velocidad angular mínima para penalizar el estancamiento
+        self.min_angular_velocity_threshold = 0.05 
+
+        # Umbral para detectar si el vaso ha sido movido/volteado
+        self.cup_movement_threshold = 0.05 # Si el vaso se mueve más de 5cm, penalizar/terminar
 
     def reset(self):
         p.resetSimulation()
@@ -98,7 +80,7 @@ class RobotEnv:
                                     targetPosition=self.robot_initial_joint_positions[i],
                                     force=500
                                     )
-        for _ in range(240):
+        for _ in range(240): # Pequeña simulación para que el robot se asiente
             p.stepSimulation()
 
         cup_start_pos = TARGET_CUP_POS
@@ -106,6 +88,7 @@ class RobotEnv:
 
         self.cup_id = p.loadURDF(CUP_URDF_PATH, cup_start_pos, cup_start_orn, useFixedBase=False)
 
+        # Para asegurar que el vaso se asiente correctamente al inicio
         constraint_id = p.createConstraint(
             parentBodyUniqueId=self.cup_id,
             parentLinkIndex=-1,
@@ -119,6 +102,9 @@ class RobotEnv:
         for _ in range(50):
             p.stepSimulation()
         p.removeConstraint(constraint_id)
+
+        # Guardar la posición inicial real del vaso después de asentarse
+        self.initial_cup_pos = np.array(p.getBasePositionAndOrientation(self.cup_id)[0])
 
         self.current_episode_steps = 0
         observation = self._get_observation()
@@ -152,45 +138,76 @@ class RobotEnv:
         p.stepSimulation()
 
         # Obtener el estado actual para la observación y las velocidades
-        observation = self._get_observation()
-        effector_pos = observation[0:3] # Los primeros 3 elementos son la posición del efector final
-        joint_velocities = observation[10:17] # Del elemento 10 al 16 son las velocidades angulares de las 7 articulaciones
-
-        distance_to_target = np.linalg.norm(effector_pos - self.target_cup_pos)
-
-        # Recompensa Densa por proximidad
-        reward = 1.0 / (distance_to_target + 0.01)
-
-        # Recompensa grande si alcanza el objetivo con un umbral muy pequeño
-        if distance_to_target < 0.05:
-            reward += 1000.0
-            done = True
-            print(f"¡Objetivo alcanzado! Distancia final: {distance_to_target:.4f}")
-
-        # Penalización por velocidad angular excesiva
-        # Calcula la magnitud de la velocidad angular para cada articulación.
-        # Si alguna articulación excede el umbral, aplica una penalización.
-        angular_velocity_penalty = 0.0
-        for vel in joint_velocities:
-            if abs(vel) > self.max_angular_velocity_threshold:
-                # Penalización cuadrática para castigar más las desviaciones grandes
-                # Puedes ajustar el factor 10.0 según lo severo que quieras que sea.
-                angular_velocity_penalty += 10.0 * (abs(vel) - self.max_angular_velocity_threshold)**2 
+        observation = self._get_observation() 
         
-        # Resta la penalización a la recompensa total
-        reward -= angular_velocity_penalty
+        # Desempaquetar la observación actualizada
+        effector_pos = observation[0:3] 
+        joint_velocities = observation[10:17] 
+
+        # Obtener la posición actual del vaso
+        current_cup_pos = np.array(p.getBasePositionAndOrientation(self.cup_id)[0])
+        distance_cup_moved = np.linalg.norm(current_cup_pos - self.initial_cup_pos)
+
+
+        # --- CÁLCULO DE RECOMPENSAS Y PENALIZACIONES ---
+
+        # Recompensa Densa por proximidad del efector al vaso
+        # Ahora el objetivo es "llegar al vaso", no "a la posición inicial del vaso"
+        # ¡IMPORTANTE! Si el vaso se mueve, la recompensa por distancia debería ser a la posición actual del vaso
+        # o a la posición objetivo original si el vaso está fijo.
+        # Dado que el vaso es fijo en TARGET_CUP_POS, mantenemos la distancia a esa posición.
+        distance_to_target = np.linalg.norm(effector_pos - self.target_cup_pos)
+        reward += 10.0 / (distance_to_target + 0.1) # Factor aumentado a 10.0 para mayor relevancia
+
+
+        # Penalización si el vaso se mueve significativamente (se golpea o voltea)
+        if distance_cup_moved > self.cup_movement_threshold:
+            reward += 20000.0 # Penalización severa por mover el vaso
+            done = True # El episodio termina si el vaso es golpeado/movido
+            print(f"¡Vaso movido/golpeado! Distancia movida: {distance_cup_moved:.4f}. Episodio terminado.")
+
+
+        # Condición de éxito: Efector final cerca del objetivo Y vaso no se ha movido
+        # ¡Aumentamos la recompensa de éxito para que sea más relevante!
+        # if distance_cup_moved < self.cup_movement_threshold:
+        #     reward += 10000.0 # Recompensa de éxito mucho más alta
+        #     done = True
+        #     print(f"¡Objetivo alcanzado limpiamente! Distancia final: {distance_to_target:.4f}, Vaso movido: {distance_cup_moved:.4f}")
+
+
+        # # Penalización por velocidad angular excesiva (movimientos muy bruscos)
+        # angular_velocity_high_penalty = 0.0
+        # for vel in joint_velocities:
+        #     if abs(vel) > self.max_angular_velocity_threshold:
+        #         angular_velocity_high_penalty += 2.0 * (abs(vel) - self.max_angular_velocity_threshold)**2 # Aumentado a 20.0
+        # reward -= angular_velocity_high_penalty*0.5
+
+
+        # # Penalización por velocidad angular muy baja (estancamiento)
+        # angular_velocity_low_penalty = 0.0
+        # # Solo penalizamos si no estamos muy cerca del objetivo
+        # if not done and distance_to_target > 0.1: 
+        #     for vel in joint_velocities:
+        #         if abs(vel) < self.min_angular_velocity_threshold:
+        #             angular_velocity_low_penalty += 1.0 # Aumentado a 10.0
+        # reward -= angular_velocity_low_penalty*0.5
         
         # Penalización suave por cada paso de tiempo para fomentar la eficiencia
-        reward -= 0.01 
+        # Reducimos la penalización por paso para que la recompensa por distancia y éxito sean más relevantes
+        reward -= 0.001 # Reducida de 0.1 a 0.05
+
 
         # Fin de episodio por máximo de pasos
         if self.current_episode_steps >= self.max_episode_steps:
             done = True
-            reward -= 10.0 # Penalización por fallar en el tiempo
+            reward -= 10.0 # Penalización por fallar en el tiempo (aumentada un poco)
             print("Máximo de pasos alcanzado. No se alcanzó el objetivo.")
 
+
         info['distance_to_target'] = distance_to_target
-        info['angular_velocity_penalty'] = angular_velocity_penalty # Para depuración
+        info['distance_cup_moved'] = distance_cup_moved
+        info['angular_velocity_high_penalty'] = angular_velocity_high_penalty 
+        info['angular_velocity_low_penalty'] = angular_velocity_low_penalty 
         
         return observation, reward, done, info
     
@@ -204,9 +221,10 @@ class RobotEnv:
         joint_velocities = [state[1] for state in joint_states]
 
         observation = np.concatenate([
-            np.array(effector_pos),
-            np.array(joint_angles),
-            np.array(joint_velocities)
+            np.array(effector_pos),      # 3 valores (X, Y, Z del efector)
+            np.array(joint_angles),     # 7 valores (posición angular de cada articulación)
+            np.array(joint_velocities), # 7 valores (velocidad angular de cada articulación)
+            self.target_cup_pos          # 3 valores (posición X, Y, Z del vaso objetivo)
         ])
         return observation
 
