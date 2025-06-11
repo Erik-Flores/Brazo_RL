@@ -114,7 +114,7 @@ if __name__ == "__main__":
     )
 
     entrenador = EntrenadorRL(entorno, agente_ppo, pasos_por_lote=2048)
-    entrenador.entrenar(num_iteraciones=50)
+    entrenador.entrenar(num_iteraciones=100)
 
     entrenador.guardar_agente("agente_final.pth")
     entorno.close()
