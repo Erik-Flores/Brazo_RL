@@ -1,232 +1,195 @@
 import pybullet as p
 import pybullet_data
-import time
-import os
 import numpy as np
-import math
+import os
 
-# Constantes del entorno
-ROBOT_URDF_PATH = os.path.join(pybullet_data.getDataPath(), "kuka_iiwa", "model.urdf")
-CUP_URDF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "simple_cup.urdf")
-PLANE_URDF_PATH = os.path.join(pybullet_data.getDataPath(), "plane.urdf")
+RUTA_URDF_ROBOT = os.path.join(pybullet_data.getDataPath(), "kuka_iiwa", "model.urdf")
+RUTA_URDF_VASO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "simple_cup.urdf")
+RUTA_URDF_PLANO = os.path.join(pybullet_data.getDataPath(), "plane.urdf")
 
-# Límites del espacio de trabajo y acción
 X_MIN = 0.5
 X_MAX = 1.0 
-TABLE_HEIGHT = 0.0
+ALTURA_MESA = 0.0
 
-# Posición OBJETIVO FIJA para el vaso
-TARGET_CUP_POS = [0.5, 0.5, 0.0] # Fija en [0.5, 0.5, 0.0]
+POSICION_OBJETIVO_VASO = [0.5, 0.5, 0.0]
+PASOS_MAXIMOS_EPISODIO = 1000
 
-MAX_EPISODE_STEPS = 1000
-
-class RobotEnv:
-    def __init__(self, render=True):
-        if render:
-            self.physicsClient = p.connect(p.GUI)
+class EntornoRobot:
+    def __init__(self, renderizar=True):
+        if renderizar:
+            self.cliente_fisica = p.connect(p.GUI)
         else:
-            self.physicsClient = p.connect(p.DIRECT)
+            self.cliente_fisica = p.connect(p.DIRECT)
 
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
         p.setGravity(0, 0, -9.8)
         p.setTimeStep(1./240.)
 
-        self.robot_id = None
-        self.cup_id = None
-        self.plane_id = None
+        self.id_robot = None
+        self.id_vaso = None
+        self.id_plano = None
 
-        self.joint_indices = [0, 1, 2, 3, 4, 5, 6]
-        self.joint_limits_low = [-2.967, -2.094, -2.967, -2.094, -2.967, -2.094, -3.054]
-        self.joint_limits_high = [2.967, 2.094, 2.967, 2.094, 2.967, 2.094, 3.054]
+        self.indices_articulaciones = [0, 1, 2, 3, 4, 5, 6]
+        self.limites_articulaciones_bajo = [-2.967, -2.094, -2.967, -2.094, -2.967, -2.094, -3.054]
+        self.limites_articulaciones_alto = [2.967, 2.094, 2.967, 2.094, 2.967, 2.094, 3.054]
 
-        self.action_space_dims = len(self.joint_indices)
-        self.action_scale = 0.1 # Aumentado para movimientos más rápidos
+        self.dims_espacio_accion = len(self.indices_articulaciones)
+        self.escala_accion = 0.1
 
-        # Posición del efector final (3D) + Ángulos de las articulaciones (7) + Velocidades de las articulaciones (7) + Posición del objetivo (3D)
-        self.observation_space_dims = 3 + len(self.joint_indices) + len(self.joint_indices) + 3 
+        self.dims_espacio_observacion = 3 + len(self.indices_articulaciones) + len(self.indices_articulaciones) + 3 
 
-        self.current_episode_steps = 0
-        self.max_episode_steps = MAX_EPISODE_STEPS
-        self.robot_initial_joint_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        self.pasos_episodio_actual = 0
+        self.pasos_maximos_episodio = PASOS_MAXIMOS_EPISODIO
+        self.posiciones_iniciales_articulaciones_robot = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-        self.render_mode = render
+        self.posicion_objetivo_vaso = np.array(POSICION_OBJETIVO_VASO)
+        self.posicion_inicial_vaso = None
+        self.vaso_golpeado = False
 
-        self.target_cup_pos = np.array(TARGET_CUP_POS)
-        self.initial_cup_pos = None # Para almacenar la posición inicial del vaso
-
-        # Definir un umbral de velocidad angular máxima aceptable
-        self.max_angular_velocity_threshold = 0.5 
-        
-        # Umbral de velocidad angular mínima para penalizar el estancamiento
-        self.min_angular_velocity_threshold = 0.05 
-
-        # Umbral para detectar si el vaso ha sido movido/volteado
-        self.cup_movement_threshold = 0.05 # Si el vaso se mueve más de 5cm, penalizar/terminar
+        self.umbral_golpe_vaso = 0.05
 
     def reset(self):
         p.resetSimulation()
         p.setGravity(0, 0, -9.8)
-        self.plane_id = p.loadURDF(PLANE_URDF_PATH)
+        self.id_plano = p.loadURDF(RUTA_URDF_PLANO)
 
-        robot_start_pos = [0, 0, 0]
-        robot_start_orientation = p.getQuaternionFromEuler([0, 0, 0])
-        self.robot_id = p.loadURDF(ROBOT_URDF_PATH, robot_start_pos, robot_start_orientation, useFixedBase=True)
+        posicion_inicio_robot = [0, 0, 0]
+        orientacion_inicio_robot = p.getQuaternionFromEuler([0, 0, 0])
+        self.id_robot = p.loadURDF(RUTA_URDF_ROBOT, posicion_inicio_robot, orientacion_inicio_robot, useFixedBase=True)
 
-        for i, joint_index in enumerate(self.joint_indices):
-            p.resetJointState(self.robot_id, joint_index, self.robot_initial_joint_positions[i])
-            p.setJointMotorControl2(self.robot_id,
-                                    joint_index,
+        for i, indice_articulacion in enumerate(self.indices_articulaciones):
+            p.resetJointState(self.id_robot, indice_articulacion, self.posiciones_iniciales_articulaciones_robot[i])
+            p.setJointMotorControl2(self.id_robot,
+                                    indice_articulacion,
                                     p.POSITION_CONTROL,
-                                    targetPosition=self.robot_initial_joint_positions[i],
-                                    force=500
-                                    )
-        for _ in range(240): # Pequeña simulación para que el robot se asiente
+                                    targetPosition=self.posiciones_iniciales_articulaciones_robot[i],
+                                    force=500)
+        
+        for _ in range(240):
             p.stepSimulation()
 
-        cup_start_pos = TARGET_CUP_POS
-        cup_start_orn = p.getQuaternionFromEuler([0, 0, 0])
+        posicion_inicio_vaso = POSICION_OBJETIVO_VASO
+        orientacion_inicio_vaso = p.getQuaternionFromEuler([0, 0, 0])
 
-        self.cup_id = p.loadURDF(CUP_URDF_PATH, cup_start_pos, cup_start_orn, useFixedBase=False)
+        self.id_vaso = p.loadURDF(RUTA_URDF_VASO, posicion_inicio_vaso, orientacion_inicio_vaso, useFixedBase=False)
 
-        # Para asegurar que el vaso se asiente correctamente al inicio
-        constraint_id = p.createConstraint(
-            parentBodyUniqueId=self.cup_id,
+        id_restriccion = p.createConstraint(
+            parentBodyUniqueId=self.id_vaso,
             parentLinkIndex=-1,
             childBodyUniqueId=-1,
             childLinkIndex=-1,
             jointType=p.JOINT_FIXED,
             jointAxis=[0, 0, 0],
             parentFramePosition=[0, 0, 0],
-            childFramePosition=cup_start_pos
+            childFramePosition=posicion_inicio_vaso
         )
+        
         for _ in range(50):
             p.stepSimulation()
-        p.removeConstraint(constraint_id)
+        p.removeConstraint(id_restriccion)
 
-        # Guardar la posición inicial real del vaso después de asentarse
-        self.initial_cup_pos = np.array(p.getBasePositionAndOrientation(self.cup_id)[0])
+        self.posicion_inicial_vaso = np.array(p.getBasePositionAndOrientation(self.id_vaso)[0])
+        self.pasos_episodio_actual = 0
+        self.vaso_golpeado = False
+        self.distancia_anterior = None
+        
+        observacion = self._obtener_observacion()
+        return observacion
 
-        self.current_episode_steps = 0
-        observation = self._get_observation()
-        return observation
+    def step(self, accion):
+        self.pasos_episodio_actual += 1
 
-    def step(self, action):
-        self.current_episode_steps += 1
-
-        reward = 0.0
-        done = False
+        recompensa = 0.0
+        terminado = False
         info = {}
 
-        joint_actions = action 
+        posiciones_articulaciones_actuales = [p.getJointState(self.id_robot, i)[0] for i in self.indices_articulaciones]
 
-        current_joint_positions = [p.getJointState(self.robot_id, i)[0] for i in self.joint_indices]
-
-        target_joint_positions = []
-        for i, delta in enumerate(joint_actions):
-            new_pos = current_joint_positions[i] + delta * self.action_scale
-            new_pos = np.clip(new_pos, self.joint_limits_low[i], self.joint_limits_high[i])
-            target_joint_positions.append(new_pos)
+        posiciones_objetivo_articulaciones = []
+        for i, delta in enumerate(accion):
+            nueva_pos = posiciones_articulaciones_actuales[i] + delta * self.escala_accion
+            nueva_pos = np.clip(nueva_pos, self.limites_articulaciones_bajo[i], self.limites_articulaciones_alto[i])
+            posiciones_objetivo_articulaciones.append(nueva_pos)
 
         p.setJointMotorControlArray(
-            self.robot_id,
-            self.joint_indices,
+            self.id_robot,
+            self.indices_articulaciones,
             p.POSITION_CONTROL,
-            targetPositions=target_joint_positions,
-            forces=[500] * len(self.joint_indices)
+            targetPositions=posiciones_objetivo_articulaciones,
+            forces=[500] * len(self.indices_articulaciones)
         )
 
         p.stepSimulation()
 
-        # Obtener el estado actual para la observación y las velocidades
-        observation = self._get_observation() 
+        observacion = self._obtener_observacion()
+        posicion_efector = observacion[0:3]
+        velocidades_articulaciones = observacion[10:17]
+        posicion_vaso_actual = np.array(p.getBasePositionAndOrientation(self.id_vaso)[0])
+        distancia_vaso_movido = np.linalg.norm(posicion_vaso_actual - self.posicion_inicial_vaso)
+
+        distancia_efector_a_vaso = np.linalg.norm(posicion_efector - posicion_vaso_actual)
         
-        # Desempaquetar la observación actualizada
-        effector_pos = observation[0:3] 
-        joint_velocities = observation[10:17] 
-
-        # Obtener la posición actual del vaso
-        current_cup_pos = np.array(p.getBasePositionAndOrientation(self.cup_id)[0])
-        distance_cup_moved = np.linalg.norm(current_cup_pos - self.initial_cup_pos)
-
-
-        # --- CÁLCULO DE RECOMPENSAS Y PENALIZACIONES ---
-
-        # Recompensa Densa por proximidad del efector al vaso
-        # Ahora el objetivo es "llegar al vaso", no "a la posición inicial del vaso"
-        # ¡IMPORTANTE! Si el vaso se mueve, la recompensa por distancia debería ser a la posición actual del vaso
-        # o a la posición objetivo original si el vaso está fijo.
-        # Dado que el vaso es fijo en TARGET_CUP_POS, mantenemos la distancia a esa posición.
-        distance_to_target = np.linalg.norm(effector_pos - self.target_cup_pos)
-        reward += 10.0 / (distance_to_target + 0.1) # Factor aumentado a 10.0 para mayor relevancia
-
-
-        # Penalización si el vaso se mueve significativamente (se golpea o voltea)
-        if distance_cup_moved > self.cup_movement_threshold:
-            reward += 20000.0 # Penalización severa por mover el vaso
-            done = True # El episodio termina si el vaso es golpeado/movido
-            print(f"¡Vaso movido/golpeado! Distancia movida: {distance_cup_moved:.4f}. Episodio terminado.")
-
-
-        # Condición de éxito: Efector final cerca del objetivo Y vaso no se ha movido
-        # ¡Aumentamos la recompensa de éxito para que sea más relevante!
-        # if distance_cup_moved < self.cup_movement_threshold:
-        #     reward += 10000.0 # Recompensa de éxito mucho más alta
-        #     done = True
-        #     print(f"¡Objetivo alcanzado limpiamente! Distancia final: {distance_to_target:.4f}, Vaso movido: {distance_cup_moved:.4f}")
-
-
-        # # Penalización por velocidad angular excesiva (movimientos muy bruscos)
-        # angular_velocity_high_penalty = 0.0
-        # for vel in joint_velocities:
-        #     if abs(vel) > self.max_angular_velocity_threshold:
-        #         angular_velocity_high_penalty += 2.0 * (abs(vel) - self.max_angular_velocity_threshold)**2 # Aumentado a 20.0
-        # reward -= angular_velocity_high_penalty*0.5
-
-
-        # # Penalización por velocidad angular muy baja (estancamiento)
-        # angular_velocity_low_penalty = 0.0
-        # # Solo penalizamos si no estamos muy cerca del objetivo
-        # if not done and distance_to_target > 0.1: 
-        #     for vel in joint_velocities:
-        #         if abs(vel) < self.min_angular_velocity_threshold:
-        #             angular_velocity_low_penalty += 1.0 # Aumentado a 10.0
-        # reward -= angular_velocity_low_penalty*0.5
+        if self.distancia_anterior is None:
+            self.distancia_anterior = distancia_efector_a_vaso
         
-        # Penalización suave por cada paso de tiempo para fomentar la eficiencia
-        # Reducimos la penalización por paso para que la recompensa por distancia y éxito sean más relevantes
-        reward -= 0.001 # Reducida de 0.1 a 0.05
-
-
-        # Fin de episodio por máximo de pasos
-        if self.current_episode_steps >= self.max_episode_steps:
-            done = True
-            reward -= 10.0 # Penalización por fallar en el tiempo (aumentada un poco)
-            print("Máximo de pasos alcanzado. No se alcanzó el objetivo.")
-
-
-        info['distance_to_target'] = distance_to_target
-        info['distance_cup_moved'] = distance_cup_moved
-        info['angular_velocity_high_penalty'] = angular_velocity_high_penalty 
-        info['angular_velocity_low_penalty'] = angular_velocity_low_penalty 
+        mejora_distancia = self.distancia_anterior - distancia_efector_a_vaso
+        self.distancia_anterior = distancia_efector_a_vaso
         
-        return observation, reward, done, info
+        recompensa += mejora_distancia * 10.0
+        recompensa += 1.0 / (distancia_efector_a_vaso + 0.1)
+
+        velocidad_total = sum(abs(v) for v in velocidades_articulaciones)
+        if velocidad_total < 0.1:
+            recompensa -= 0.5
+
+        if distancia_vaso_movido > self.umbral_golpe_vaso and not self.vaso_golpeado:
+            recompensa += 100.0
+            self.vaso_golpeado = True
+            terminado = True
+            print(f"¡Vaso golpeado! Distancia movida: {distancia_vaso_movido:.4f}")
+
+        orientacion_vaso = p.getBasePositionAndOrientation(self.id_vaso)[1]
+        euler_vaso = p.getEulerFromQuaternion(orientacion_vaso)
+        inclinacion_vaso = abs(euler_vaso[0]) + abs(euler_vaso[1])
+        
+        if inclinacion_vaso > 0.5:
+            recompensa += 200.0
+            terminado = True
+            print(f"¡Vaso tirado! Inclinación: {inclinacion_vaso:.4f}")
+
+        if distancia_vaso_movido > 0.3:
+            recompensa += 150.0
+            terminado = True
+            print(f"¡Vaso alejado! Distancia: {distancia_vaso_movido:.4f}")
+
+        recompensa -= 0.1
+
+        if self.pasos_episodio_actual >= self.pasos_maximos_episodio:
+            terminado = True
+            recompensa -= 10.0
+
+        info['distancia_efector_a_vaso'] = distancia_efector_a_vaso
+        info['distancia_vaso_movido'] = distancia_vaso_movido
+        info['inclinacion_vaso'] = inclinacion_vaso
+        
+        return observacion, recompensa, terminado, info
     
-    def _get_observation(self):
-        effector_link_index = p.getNumJoints(self.robot_id) - 1
-        link_state = p.getLinkState(self.robot_id, effector_link_index)
-        effector_pos = link_state[0]
+    def _obtener_observacion(self):
+        indice_enlace_efector = p.getNumJoints(self.id_robot) - 1
+        estado_enlace = p.getLinkState(self.id_robot, indice_enlace_efector)
+        posicion_efector = estado_enlace[0]
 
-        joint_states = p.getJointStates(self.robot_id, self.joint_indices)
-        joint_angles = [state[0] for state in joint_states]
-        joint_velocities = [state[1] for state in joint_states]
+        estados_articulaciones = p.getJointStates(self.id_robot, self.indices_articulaciones)
+        angulos_articulaciones = [estado[0] for estado in estados_articulaciones]
+        velocidades_articulaciones = [estado[1] for estado in estados_articulaciones]
 
-        observation = np.concatenate([
-            np.array(effector_pos),      # 3 valores (X, Y, Z del efector)
-            np.array(joint_angles),     # 7 valores (posición angular de cada articulación)
-            np.array(joint_velocities), # 7 valores (velocidad angular de cada articulación)
-            self.target_cup_pos          # 3 valores (posición X, Y, Z del vaso objetivo)
+        observacion = np.concatenate([
+            np.array(posicion_efector),
+            np.array(angulos_articulaciones),
+            np.array(velocidades_articulaciones),
+            np.array(p.getBasePositionAndOrientation(self.id_vaso)[0])
         ])
-        return observation
+        return observacion
 
     def close(self):
-        p.disconnect(self.physicsClient)
+        p.disconnect(self.cliente_fisica)
