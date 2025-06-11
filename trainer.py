@@ -127,14 +127,13 @@ if __name__ == "__main__":
         observation_space_dims=observation_space_dims,
         action_space_dims=action_space_dims,
         actor_lr=1e-4, 
-        # ¡IMPORTANTE! Elimina o comenta la siguiente línea si está presente:
-        # critic_lr=3e-4, 
         gamma=0.99,
         gae_lambda=0.95,
-        clip_param=0.2,
+        clip_param=0.3, # Puedes probar a aumentar este valor a 0.3 o 0.4 para más exploración inicial
         ppo_epochs=10,
-        mini_batch_size=64
+        mini_batch_size=64,
+        entropy_coef=0.05 # Puedes aumentar este valor a 0.05 o 0.1 para más exploración
     )
 
     trainer = RLTrainer(env, ppo_agent, timesteps_per_batch=2048)
-    trainer.train(num_iterations=500)
+    trainer.train(num_iterations=100)

@@ -12,17 +12,15 @@ PLANE_URDF_PATH = os.path.join(pybullet_data.getDataPath(), "plane.urdf")
 
 # Límites del espacio de trabajo y acción
 X_MIN = 0.5
-X_MAX = 1.0 # Este rango ya no será para la generación aleatoria del vaso
+X_MAX = 1.0 
 TABLE_HEIGHT = 0.0
 
 # Posición OBJETIVO FIJA para el vaso
 TARGET_CUP_POS = [0.5, 0.5, 0.0] # Fija en [0.5, 0.5, 0.0]
 
-MAX_EPISODE_STEPS = 1000 # Reducido a 1000 pasos para acelerar
+MAX_EPISODE_STEPS = 1000
 
-# --- CONSTANTES DE CÁMARA ELIMINADAS O INUTILIZADAS ---
-# Estas constantes de cámara ya no son necesarias para la observación del agente,
-# pero se mantienen para la visualización de PyBullet GUI si render=True.
+# --- CONSTANTES DE CÁMARA (solo para visualización GUI) ---
 CAMERA_WIDTH = 64
 CAMERA_HEIGHT = 64
 CAMERA_FOV = 60
@@ -53,20 +51,16 @@ class RobotEnv:
         self.joint_limits_low = [-2.967, -2.094, -2.967, -2.094, -2.967, -2.094, -3.054]
         self.joint_limits_high = [2.967, 2.094, 2.967, 2.094, 2.967, 2.094, 3.054]
 
-        # Solo controlaremos las articulaciones, ya no hay acción de "empuje" explícita
-        self.action_space_dims = len(self.joint_indices) # 7 articulaciones
+        self.action_space_dims = len(self.joint_indices)
         self.action_scale = 0.1 # Aumentado para movimientos más rápidos
 
-        # --- MODIFICACIÓN: ESPACIO DE OBSERVACIÓN SIMPLIFICADO ---
         # Posición del efector final (3D) + Ángulos de las articulaciones (7) + Velocidades de las articulaciones (7)
         self.observation_space_dims = 3 + len(self.joint_indices) + len(self.joint_indices)
-        # --- FIN MODIFICACIÓN ---
 
         self.current_episode_steps = 0
         self.max_episode_steps = MAX_EPISODE_STEPS
         self.robot_initial_joint_positions = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-        # --- ATRIBUTOS PARA LA CÁMARA (solo para visualización GUI) ---
         self.view_matrix = p.computeViewMatrix(
             cameraEyePosition=CAMERA_POSITION,
             cameraTargetPosition=CAMERA_TARGET,
@@ -79,10 +73,13 @@ class RobotEnv:
             farVal=CAMERA_FAR
         )
         self.render_mode = render
-        # --- FIN ATRIBUTOS PARA LA CÁMARA ---
 
-        # Almacenar la posición objetivo del vaso
         self.target_cup_pos = np.array(TARGET_CUP_POS)
+
+        # Definir un umbral de velocidad angular máxima aceptable
+        # Ajusta este valor según cuánto quieras penalizar las velocidades altas.
+        # Un valor más bajo penalizará más, uno más alto será más permisivo.
+        self.max_angular_velocity_threshold = 0.5 # Radianes por segundo (ejemplo)
 
     def reset(self):
         p.resetSimulation()
@@ -104,17 +101,15 @@ class RobotEnv:
         for _ in range(240):
             p.stepSimulation()
 
-        # Vaso se genera en la posición FIJA
         cup_start_pos = TARGET_CUP_POS
-        cup_start_orn = p.getQuaternionFromEuler([0, 0, 0]) # Orientación fija para simplificar
+        cup_start_orn = p.getQuaternionFromEuler([0, 0, 0])
 
         self.cup_id = p.loadURDF(CUP_URDF_PATH, cup_start_pos, cup_start_orn, useFixedBase=False)
 
-        # Fijar brevemente el vaso para que se asiente, luego liberar
         constraint_id = p.createConstraint(
             parentBodyUniqueId=self.cup_id,
             parentLinkIndex=-1,
-            childBodyUniqueId=-1, # World
+            childBodyUniqueId=-1,
             childLinkIndex=-1,
             jointType=p.JOINT_FIXED,
             jointAxis=[0, 0, 0],
@@ -136,7 +131,6 @@ class RobotEnv:
         done = False
         info = {}
 
-        # Todas las acciones son para las articulaciones
         joint_actions = action 
 
         current_joint_positions = [p.getJointState(self.robot_id, i)[0] for i in self.joint_indices]
@@ -157,57 +151,58 @@ class RobotEnv:
 
         p.stepSimulation()
 
-        # --- Calcular Recompensa (SOLO por proximidad al objetivo) ---
-        effector_link_index = p.getNumJoints(self.robot_id) - 1
-        link_state = p.getLinkState(self.robot_id, effector_link_index)
-        effector_pos = np.array(link_state[0])
+        # Obtener el estado actual para la observación y las velocidades
+        observation = self._get_observation()
+        effector_pos = observation[0:3] # Los primeros 3 elementos son la posición del efector final
+        joint_velocities = observation[10:17] # Del elemento 10 al 16 son las velocidades angulares de las 7 articulaciones
 
-        # Distancia euclidiana al objetivo fijo del vaso
         distance_to_target = np.linalg.norm(effector_pos - self.target_cup_pos)
 
-        # Recompensa Densa: Cuanto más cerca, mayor recompensa
-        # Usamos una recompensa negativa que se vuelve menos negativa a medida que se acerca
-        # O una recompensa positiva que aumenta exponencialmente al acercarse
-        reward = -distance_to_target * 10.0 # Penalización directa por distancia, ajusta el factor
-        
-        # Opcional: una recompensa más agresiva cerca del objetivo
-        # if distance_to_target < 0.1: # Si está muy cerca (10 cm)
-        #     reward += (0.1 - distance_to_target) * 50.0 # Recompensa extra por ser super preciso
-        
+        # Recompensa Densa por proximidad
+        reward = 1.0 / (distance_to_target + 0.01)
+
         # Recompensa grande si alcanza el objetivo con un umbral muy pequeño
-        # Esto ayuda a que el agente sepa cuándo ha "ganado"
-        if distance_to_target < 0.05: # Si está a menos de 5 cm del objetivo
-            reward += 500.0 # Gran recompensa
+        if distance_to_target < 0.05:
+            reward += 1000.0
             done = True
             print(f"¡Objetivo alcanzado! Distancia final: {distance_to_target:.4f}")
 
-        # Penalización por tiempo (si no se ha alcanzado el objetivo)
-        reward -= 0.01 # Pequeña penalización por cada paso
+        # Penalización por velocidad angular excesiva
+        # Calcula la magnitud de la velocidad angular para cada articulación.
+        # Si alguna articulación excede el umbral, aplica una penalización.
+        angular_velocity_penalty = 0.0
+        for vel in joint_velocities:
+            if abs(vel) > self.max_angular_velocity_threshold:
+                # Penalización cuadrática para castigar más las desviaciones grandes
+                # Puedes ajustar el factor 10.0 según lo severo que quieras que sea.
+                angular_velocity_penalty += 10.0 * (abs(vel) - self.max_angular_velocity_threshold)**2 
+        
+        # Resta la penalización a la recompensa total
+        reward -= angular_velocity_penalty
+        
+        # Penalización suave por cada paso de tiempo para fomentar la eficiencia
+        reward -= 0.01 
 
-        # Fin de episodio por máximo de pasos (si no se ha alcanzado el objetivo)
+        # Fin de episodio por máximo de pasos
         if self.current_episode_steps >= self.max_episode_steps:
             done = True
-            reward -= 50.0 # Penalización significativa por no lograr el objetivo a tiempo
+            reward -= 10.0 # Penalización por fallar en el tiempo
             print("Máximo de pasos alcanzado. No se alcanzó el objetivo.")
 
-        observation = self._get_observation()
-        # Puedes añadir información extra si es útil para depuración, pero no para el agente
         info['distance_to_target'] = distance_to_target
+        info['angular_velocity_penalty'] = angular_velocity_penalty # Para depuración
         
         return observation, reward, done, info
     
     def _get_observation(self):
-        # Obtener la posición del efector final
         effector_link_index = p.getNumJoints(self.robot_id) - 1
         link_state = p.getLinkState(self.robot_id, effector_link_index)
-        effector_pos = link_state[0] # (x, y, z) del efector final
+        effector_pos = link_state[0]
 
-        # Ángulos y velocidades de las articulaciones del brazo
         joint_states = p.getJointStates(self.robot_id, self.joint_indices)
         joint_angles = [state[0] for state in joint_states]
         joint_velocities = [state[1] for state in joint_states]
 
-        # Combina toda la información en un solo vector de NumPy
         observation = np.concatenate([
             np.array(effector_pos),
             np.array(joint_angles),

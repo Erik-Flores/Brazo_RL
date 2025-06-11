@@ -49,7 +49,12 @@ class ActorCriticNetwork(nn.Module):
         self.common_relu2 = nn.ReLU()
 
         self.actor_mean_layer = nn.Linear(256, action_space_dims)
-        self.log_std = nn.Parameter(torch.full((action_space_dims,), -0.5)) 
+        # log_std permite que el valor se ajuste durante el entrenamiento.
+        # Inicializamos con un valor negativo pequeño (-0.5) para tener un std ~0.6,
+        # lo que significa que las acciones al principio serán más "predecibles" (menos aleatorias).
+        # Para más exploración, podemos iniciar con un valor más cercano a 0 (e.g., 0.0) o incluso positivo (e.g., 0.5)
+        # lo que resultará en un std más alto y acciones más aleatorias al principio.
+        self.log_std = nn.Parameter(torch.full((action_space_dims,), 0.0)) 
 
         self.critic_value_layer = nn.Linear(256, 1)
 
@@ -57,8 +62,8 @@ class ActorCriticNetwork(nn.Module):
         common_output = self.common_relu1(self.common_fc1(x))
         common_output = self.common_relu2(self.common_fc2(common_output))
 
-        mean = torch.tanh(self.actor_mean_layer(common_output))
-        std = torch.exp(self.log_std)
+        mean = torch.tanh(self.actor_mean_layer(common_output)) # Acciones en [-1, 1]
+        std = torch.exp(self.log_std) # std from log_std parameter, always positive
 
         action_distribution = Normal(mean, std)
         
@@ -71,7 +76,7 @@ class ActorCriticNetwork(nn.Module):
 class PPOAgent:
     def __init__(self, observation_space_dims, action_space_dims,
                  clip_param=0.2, ppo_epochs=10, mini_batch_size=64,
-                 actor_lr=3e-4, gamma=0.99, gae_lambda=0.95): # Eliminado critic_lr
+                 actor_lr=3e-4, gamma=0.99, gae_lambda=0.95, entropy_coef=0.05): # Nuevo: entropy_coef
         
         self.actor_critic = ActorCriticNetwork(observation_space_dims, action_space_dims)
         
@@ -82,6 +87,7 @@ class PPOAgent:
         self.mini_batch_size = mini_batch_size
         self.gamma = gamma
         self.gae_lambda = gae_lambda
+        self.entropy_coef = entropy_coef # Coeficiente para el término de entropía
 
         self.state_normalizer = StateNormalizer(observation_space_dims)
 
@@ -92,14 +98,17 @@ class PPOAgent:
         action_dist, value = self.actor_critic(obs_tensor)
         action = action_dist.sample()
         
-        log_prob = action_dist.log_prob(action).sum(dim=-1)
+        # log_prob and value needs to be detached from the graph to be stored
+        # sum over the dimensions of log_prob to get a single value per action
+        log_prob = action_dist.log_prob(action).sum(dim=-1) 
         
         return action.squeeze(0).detach().numpy(), log_prob.item(), value.item()
 
     def evaluate_action_and_value(self, obs_tensor, action_tensor):
         action_dist, value = self.actor_critic(obs_tensor)
         log_prob = action_dist.log_prob(action_tensor).sum(dim=-1)
-        entropy = action_dist.entropy().sum(dim=-1)
+        # Sum over the dimensions of entropy to get a single value per action
+        entropy = action_dist.entropy().sum(dim=-1) 
         return log_prob, value, entropy
 
     def update(self, batch_obs, batch_actions, batch_log_probs, batch_returns, batch_advantages):
@@ -111,7 +120,6 @@ class PPOAgent:
 
         batch_advantages = (batch_advantages - batch_advantages.mean()) / (batch_advantages.std() + 1e-8)
 
-        # Para llevar el registro de las pérdidas promedio del batch
         total_actor_loss = 0
         total_critic_loss = 0
         num_minibatches = 0
@@ -132,12 +140,16 @@ class PPOAgent:
 
                 new_log_probs, new_values, entropy = self.evaluate_action_and_value(mini_obs, mini_actions)
                 
+                # --- Critic Loss ---
                 critic_loss = (new_values.squeeze() - mini_returns).pow(2).mean()
 
+                # --- Actor Loss (con término de entropía) ---
                 ratio = torch.exp(new_log_probs - mini_old_log_probs)
                 surr1 = ratio * mini_advantages
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * mini_advantages
-                actor_loss = -torch.min(surr1, surr2).mean() - 0.001 * entropy.mean()
+                
+                # Maximizar la entropía es equivalente a minimizar -entropy_coef * entropy
+                actor_loss = -torch.min(surr1, surr2).mean() - self.entropy_coef * entropy.mean() 
 
                 self.optimizer.zero_grad()
                 total_loss = actor_loss + critic_loss
@@ -149,5 +161,4 @@ class PPOAgent:
                 total_critic_loss += critic_loss.item()
                 num_minibatches += 1
         
-        # --- CAMBIO CLAVE: Devolver las pérdidas promedio ---
         return total_actor_loss / num_minibatches, total_critic_loss / num_minibatches
